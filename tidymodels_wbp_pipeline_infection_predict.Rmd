@@ -1,0 +1,949 @@
+---
+title: "CP05 Random Forest"
+author: "Camron Pearce"
+date: "2024-06-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, include = TRUE)
+```
+
+## Tidying CP05 Data
+
+```{r include=FALSE, echo=TRUE}
+library(tidyverse)
+library(cowplot)
+library(tidymodels)
+library(ggplot2)
+library(knitr)
+library(readxl)
+library(corrplot)
+library(ggthemes)
+library(gridExtra)
+library(gt)
+library(gtExtras)
+library(visdat)
+library(fastDummies)
+library(MASS)
+library(glmnet)
+library(ranger)
+library(xgboost)
+library(discrim)
+library(doParallel)
+library(themis)
+library(kableExtra)
+library(vip)
+library(pROC)
+library(tune)
+library(gridExtra)
+library(kknn)
+library(yardstick)
+
+tidymodels_prefer()
+```
+
+
+
+```{r tidying}
+#formatting data like the heart failure data
+#----------------------------------------
+
+# Specify the file path of the Excel workbook
+excel_file <- "CP05.xlsx"
+
+# Define a vector of group definitions
+group_identities <- list(c(1:4), c(5:8), c(9:12), c(13:16))
+
+# Set the names of the resulting lists
+# number of names must match the amount of lists generated in group_identities, each ""
+
+group_names <- c("a", "b", "c", "d")
+
+sheet_names <- excel_sheets(excel_file)
+
+# Create a list to store the data frames
+df_list <- lapply(sheet_names, function(sheet_name) read_excel(excel_file, sheet = sheet_name))
+
+# Remove elements with names containing the word "Apnea"
+df_list <- df_list[!grepl("Apnea", sheet_names)]
+
+
+#function for summarizing each df by day collected
+
+time_clean <- function(df) {
+  df$Time <- as.Date(substr(df$Time, 1, 10), format = "%Y-%m-%d")
+  df %>%
+    group_by(Time) %>%
+    select(-c(Tbody, Phase, Recording, Alarms, Rinx, RH, Tc, Comp))
+}
+
+df_list_clean <- lapply(df_list, time_clean)
+
+#remove NAs
+df_list_clean <- lapply(df_list_clean, function(df) df[complete.cases(df), ])
+
+# Define a function to average all of the dataframes as defined by the number of group identities
+merge_n <- function(df_list_clean, indices) {
+  df_merged <- bind_rows(df_list_clean[indices])
+  return(df_merged)
+}
+
+# Apply the merge_n function to the list
+groups_merged <- lapply(group_identities, function(indices) merge_n(df_list_clean, indices))
+
+# Rename columns for each data frame in the list
+for (i in seq_along(groups_merged)) {
+  df <- groups_merged[[i]]
+  names(df)[-1] <- sub("Time_", "", names(df)[-1])
+  groups_merged[[i]] <- df
+}
+
+#trying to combine by mouse group
+# Merge the data frames within groups_merged and replace "Uninfected" with 0 and "Infected" with 1
+big_merged <- groups_merged %>%
+  bind_rows() 
+
+
+big_merged_ac <- big_merged %>% 
+  mutate(Time = ifelse(Time %in% unique(big_merged$Time)[1:4], "acute", "chronic"))
+
+
+############
+#Might need to remove this to re-run the models
+big_merged <- big_merged %>% 
+ mutate(wt = ifelse(grepl("WT", Subject), 1, ifelse(grepl("BEN", Subject), 0, NA)))
+
+
+
+
+big_merged_ac$Subject <- as.factor(big_merged_ac$Subject)
+big_merged_ac$Time <- factor(big_merged_ac$Time, levels = c("acute", "chronic"))
+
+wt_df_ac <- big_merged_ac %>% 
+  filter(grepl("WT", Subject))
+
+benac_df_ac <- big_merged_ac %>% 
+  filter(grepl("BENaC", Subject))
+
+#splitting wt and benac - averaging for initial testing purposes
+
+average_data <- big_merged %>% 
+  group_by(Subject, Time) %>% 
+  summarize_all(mean, na.rm = TRUE, .groups = "drop") %>% 
+  ungroup() 
+
+average_data_all <- average_data %>% 
+  mutate(Status = ifelse(grepl("Uninfected", Subject), 0, ifelse(grepl("Infected", Subject), 1, NA)))
+average_data_all$Status <- as.factor(average_data_all$Status)
+average_data_all$Time <- as.Date(average_data_all$Time)
+
+
+# Calculate the difference in days from the first date
+average_data_all$Day <- as.numeric(difftime(average_data_all$Time, min(average_data_all$Time), units = "days")) + 1
+
+
+average_data_ac <- average_data_all %>% 
+  mutate(Time = ifelse(Time %in% unique(average_data$Time)[1:4], "acute", "chronic"))
+average_data_ac$Status <- as.factor(average_data_ac$Status)
+average_data_ac$Time <- factor(average_data_ac$Time, levels = c("acute", "chronic"))
+
+#---------
+
+wt_df_ac <- average_data_ac %>% 
+  filter(grepl("WT", Subject))
+
+benac_df_ac <- average_data_ac %>% 
+  filter(grepl("BENaC", Subject))
+
+#-----------------------
+#beginning the process
+
+#randomizing the wt_ac data
+set.seed(7)
+wt_ac <- wt_df_ac %>% 
+  select(-Subject) %>% 
+  sample_frac(1)
+
+head(wt_ac)
+
+##data forthe entire dataset
+random_all <- average_data_ac %>% 
+  select(-Subject) %>% 
+  sample_frac(1)
+
+```
+
+Focusing only on wt data for training
+```{r}
+dim(random_all)
+vis_dat(random_all)
+```
+
+
+
+```{r visualizing}
+ggplot(random_all, aes(x = as.factor(Time), fill = "maroon")) + 
+  geom_bar() + 
+  scale_fill_manual(values = "maroon") +
+  labs(title = "Distribution of Acute vs Chronic Timepoints", x = "Status", y = "Time") +
+  theme(legend.position = "none")
+```
+
+## Variable Correlation Plots
+
+```{r correlation}
+infectioncorr <- random_all %>% 
+  select(where(is.numeric)) %>% 
+  cor() %>% 
+  corrplot(order = "AOE", type = "lower", tl.col = "black")
+```
+
+## More data visualization
+
+```{r}
+ggplot(data = random_all, aes(x = f, group = Time, fill = Time)) +
+  geom_boxplot() +
+  scale_fill_manual(labels = c("Acute", "Chronic"), values = c("lightblue", "maroon")) +
+  labs(title = "Frequency across acute and chronic phase", x = "Frequency", fill = "Phase")
+
+ggplot(data = random_all, aes(x = TVb, group = Time, fill = Time)) +
+  geom_boxplot() +
+  scale_fill_manual(labels = c("Acute", "Chronic"), values = c("lightblue", "maroon")) +
+  labs(title = "TVb across acute and chronic phase", x = "TVb", fill = "Phase")
+
+ggplot(data = random_all, aes(x = Penh, group = Time, fill = Time)) +
+  geom_boxplot() +
+  scale_fill_manual(labels = c("Acute", "Chronic"), values = c("lightblue", "maroon")) +
+  labs(title = "Penh across acute and chronic phase", x = "Penh", fill = "Phase")
+
+ggplot(data = random_all, aes(x = EF50, group = Time, fill = Time)) +
+  geom_boxplot() +
+  scale_fill_manual(labels = c("Acute", "Chronic"), values = c("lightblue", "maroon")) +
+  labs(title = "EF50 across acute and chronic phase", x = "EF50", fill = "Phase")
+
+ggplot(data = random_all, aes(x = Ti, group = Time, fill = Time)) +
+  geom_boxplot() +
+  scale_fill_manual(labels = c("Acute", "Chronic"), values = c("lightblue", "maroon")) +
+  labs(title = "Ti across acute and chronic phase", x = "Ti", fill = "Phase")
+
+ggplot(data = random_all, aes(x = Te, group = Time, fill = Time)) +
+  geom_boxplot() +
+  scale_fill_manual(labels = c("Acute", "Chronic"), values = c("lightblue", "maroon")) +
+  labs(title = "Te across acute and chronic phase", x = "Te", fill = "Phase")
+
+#removed outliers here and scaled down, maybe consider for all
+ggplot(data = random_all, aes(x = EIP, group = Time, fill = Time)) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_fill_manual(labels = c("Acute", "Chronic"), values = c("lightblue", "maroon")) +
+  labs(title = "EIP across acute and chronic phase", x = "EIP", fill = "Phase") +
+  coord_cartesian(xlim = c(2,2.75))
+
+ggplot(data = random_all, aes(x = EEP, group = Time, fill = Time)) +
+  geom_boxplot() +
+  scale_fill_manual(labels = c("Acute", "Chronic"), values = c("lightblue", "maroon")) +
+  labs(title = "EEP across acute and chronic phase", x = "EEP", fill = "Phase")
+```
+
+## Splitting Data for modeling
+
+Split into train and test
+
+```{r}
+set.seed(10)
+
+random_all_split <- random_all %>% 
+  initial_split(prop = 0.80, strata = "Status")
+
+train_all <- training(random_all_split)
+test_all <- testing(random_all_split)
+
+dim(train_all)
+dim(test_all)
+```
+
+
+### Building the random forest model
+
+```{r}
+wt_recipe <- recipe(Status ~ ., data = train_all) %>%
+  step_dummy(all_nominal_predictors()) %>%   
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors()) %>%
+  step_upsample(Status, over_ratio = 1)
+
+prep(wt_recipe) %>%
+  bake(new_data = train_all) %>%
+  head() %>%
+  kable() %>%
+  kable_styling(full_width = F) %>%
+  scroll_box(width = "100%", height = "200px")
+```
+
+### K-fold cross validation
+
+```{r}
+
+wt_folds <- vfold_cv(train_all, v = 10, strata = Status)
+
+```
+
+1. Parameters for tuning, mode and engine of Logistic Regression model
+```{r}
+#logistic regression
+wt_log_reg <- logistic_reg() %>% 
+  set_engine("glm") %>% 
+  set_mode("classification")
+
+#knn
+wt_knn_mod <- nearest_neighbor(neighbors = tune()) %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification")
+
+#LDA
+wt_lda_mod <- discrim_linear() %>% 
+  set_engine("MASS") %>% 
+  set_mode("classification")
+
+#QDA
+wt_qda_mod <- discrim_quad() %>% 
+  set_engine("MASS") %>% 
+  set_mode("classification")
+
+#Elastic Net
+wt_en_mod <- multinom_reg(mixture = tune(), penalty = tune()) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("classification")
+
+#rf
+wt_rf_mod <- rand_forest(mtry = tune(), trees = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+#boosted trees
+wt_bt_mod <- boost_tree(mtry = tune(), trees = tune(), learn_rate = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+```
+
+2. Workflow and model and recipe
+
+```{r}
+
+# Logistic Regression
+wt_log_wkflow <- workflow() %>%
+  add_model(wt_log_reg) %>%
+  add_recipe(wt_recipe)
+
+
+# KNN Model
+wt_knn_wkflow <- workflow() %>%
+  add_model(wt_knn_mod) %>%
+  add_recipe(wt_recipe)
+
+# LDA
+wt_lda_wkflow <- workflow() %>%
+  add_model(wt_lda_mod) %>%
+  add_recipe(wt_recipe)
+
+# QDA
+wt_qda_wkflow <- workflow() %>%
+  add_model(wt_qda_mod) %>%
+  add_recipe(wt_recipe)
+
+# Elastic Net
+wt_en_wkflow <- workflow() %>%
+  add_model(wt_en_mod) %>%
+  add_recipe(wt_recipe)
+
+# Random Forest
+wt_rf_wkflow <- workflow() %>%
+  add_model(wt_rf_mod) %>% 
+  add_recipe(wt_recipe)
+
+#Boosted Trees
+wt_bt_wkflow <- workflow() %>%
+  add_model(wt_bt_mod) %>%
+  add_recipe(wt_recipe)
+```
+
+3. Tuning grid to set up range
+
+```{r}
+
+#knn model
+wt_neighbors_grid <- grid_regular(neighbors(range = c(1, 20)), levels = 20)
+
+#elastic net
+wt_en_grid <- grid_regular(penalty(range = c(0.02, 3), trans = identity_trans()),
+                           mixture(range = c(0,1)), levels = 10)
+
+#random forest
+wt_rf_grid <- grid_regular(mtry(range = c(1, 10)),
+                              trees(range = c(50, 1000)),
+                              min_n(range = c(5, 25)), levels = 10)
+
+#boosted trees
+wt_bt_grid <- grid_regular(mtry(range = c(1, 10)),
+                           trees(range = c(100, 1000)),
+                           learn_rate(range = c(-10, -1)),
+                           levels = 5)
+
+```
+
+4. Actually tune to find best fit and save as rds file
+
+*dont need to run this every time, just need the .rds file, i think*
+```{r}
+#knn
+run_if <- function() {
+  if (!file.exists("wt_knn_all.rds")) {
+    registerDoParallel(cores = 6)
+    
+    wt_tune_res_knn <- tune_grid(
+      object = wt_knn_wkflow,
+      resamples = wt_folds,
+      grid = wt_neighbors_grid
+    )
+    
+    write_rds(wt_tune_res_knn, file = "wt_knn_all.rds")
+  } else {
+    message("File 'wt_knn_all.rds' already exists. Skipping the computation.")
+  }
+}
+
+# Call the function to run the code and save if 'wt_rf.rds' doesn't exist
+run_if()
+
+#--------------------------------------
+
+#knn
+run_if <- function() {
+  if (!file.exists("wt_en_all.rds")) {
+    registerDoParallel(cores = 6)
+    
+    wt_tune_res_en <- tune_grid(
+      object = wt_en_wkflow,
+      resamples = wt_folds,
+      grid = wt_en_grid
+    )
+    
+    write_rds(wt_tune_res_en, file = "wt_en_all.rds")
+  } else {
+    message("File 'wt_en_all.rds' already exists. Skipping the computation.")
+  }
+}
+
+# Call the function to run the code and save if 'wt_rf.rds' doesn't exist
+run_if()
+
+#------------------------------------------
+
+#random forest tuning
+run_if <- function() {
+  if (!file.exists("wt_rf_all.rds")) {
+    registerDoParallel(cores = 6)
+    
+    wt_tune_res_rf <- tune_grid(
+      object = wt_rf_wkflow,
+      resamples = wt_folds,
+      grid = wt_rf_grid
+    )
+    
+    write_rds(wt_tune_res_rf, file = "wt_rf_all.rds")
+  } else {
+    message("File 'wt_rf_all.rds' already exists. Skipping the computation.")
+  }
+}
+
+# Call the function to run the code and save if 'wt_rf.rds' doesn't exist
+run_if()
+
+#--------------------------------------------
+
+#knn
+run_if <- function() {
+  if (!file.exists("wt_bt_all.rds")) {
+    registerDoParallel(cores = 6)
+    
+    wt_tune_res_bt <- tune_grid(
+      object = wt_bt_wkflow,
+      resamples = wt_folds,
+      grid = wt_bt_grid
+    )
+    
+    write_rds(wt_tune_res_bt, file = "wt_bt_all.rds")
+  } else {
+    message("File 'wt_bt_all.rds' already exists. Skipping the computation.")
+  }
+}
+
+# Call the function to run the code and save if 'wt_rf.rds' doesn't exist
+run_if()
+
+
+```
+5. load tuned model
+```{r load}
+
+#knn
+wt_knn_tuned <- read_rds(file = "wt_knn_all.rds")
+
+#en
+wt_en_tuned <- read_rds(file = "wt_en_all.rds")
+
+#random forest
+wt_rf_tuned <- read_rds(file = "wt_rf_all.rds")
+
+#boosted tree
+wt_bt_tuned <- read_rds(file = "wt_bt_all.rds")
+
+```
+
+6. analyze performance
+```{r}
+
+#knn
+best_knn <- show_best(wt_knn_tuned, metric = "roc_auc")
+
+#en
+best_en <- show_best(wt_en_tuned, metric = "roc_auc")
+
+#ransom forest
+best_rf <- show_best(wt_rf_tuned, metric = "roc_auc")
+
+#boosted tree
+best_bt <- show_best(wt_bt_tuned, metric = "roc_auc")
+
+
+```
+Figure shows efficacy of various random forest models.
+
+## Evaluating the models
+
+```{r}
+#knn 
+ p_knn <- autoplot(wt_knn_tuned) +
+  theme_clean() + 
+   theme(
+     plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),   # Title
+     axis.text.x = element_text(size = 10, angle = 45, hjust = 1),      # X-axis text
+     axis.text.y = element_text(size = 10),                             # Y-axis text
+     axis.title.x = element_text(size = 12, face = "bold"),             # X-axis title
+     axis.title.y = element_text(size = 12, face = "bold")              # Y-axis title
+   ) +
+   labs(
+     x = "# Nearest Neighbors",
+     y = "Value",
+     title = "Efficacy of K-Nearest Neighbor Models"  # Customize Plot Title
+  )
+p_knn
+
+#en
+p_en <- autoplot(wt_en_tuned, metric = "roc_auc") +
+  theme_clean() + 
+   theme(
+     plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),   # Title
+     axis.text.x = element_text(size = 10, angle = 45, hjust = 1),      # X-axis text
+     axis.text.y = element_text(size = 10),                             # Y-axis text
+     axis.title.x = element_text(size = 12, face = "bold"),             # X-axis title
+     axis.title.y = element_text(size = 12, face = "bold")              # Y-axis title
+   ) +
+   labs(
+     x = "Amount of Regularization",
+     y = "ROC-AUC",
+     title = "Efficacy of Elastic Net Models"  # Customize Plot Title
+  )
+p_en
+
+
+#rf
+p_rf <- autoplot(wt_rf_tuned, metric = "roc_auc") +
+  theme_bw() +
+   theme(
+     plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),   # Title
+     axis.text.x = element_text(size = 10, angle = 45, hjust = 1),      # X-axis text
+     axis.text.y = element_text(size = 10),                             # Y-axis text
+     axis.title.x = element_text(size = 12, face = "bold"),             # X-axis title
+     axis.title.y = element_text(size = 12, face = "bold")              # Y-axis title
+   ) +
+   labs(
+     x = "# of Randomly Selected Predictors",
+     y = "ROC-AUC",
+     title = "Efficacy of Random Forest Models"  # Customize Plot Title
+  )
+p_rf
+
+#boosted tree
+p_bt <- autoplot(wt_bt_tuned, metric = "roc_auc") +
+  theme_bw() +
+   theme(
+     plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),   # Title
+     axis.text.x = element_text(size = 10, angle = 45, hjust = 1),      # X-axis text
+     axis.text.y = element_text(size = 10),                             # Y-axis text
+     axis.title.x = element_text(size = 12, face = "bold"),             # X-axis title
+     axis.title.y = element_text(size = 12, face = "bold")              # Y-axis title
+   ) +
+   labs(
+     x = "# of Randomly Selected Predictors",
+     y = "ROC-AUC",
+     title = "Efficacy of Boosted Tree Models"  # Customize Plot Title
+  )
+p_bt
+```
+
+## Select the model and apply it to the workflow
+```{r}
+#KNN
+best_wt_neighbors <- select_best(wt_knn_tuned, metric = "roc_auc")
+final_wt_knn_model <- finalize_workflow(wt_knn_wkflow, best_wt_neighbors)
+
+#en
+best_wt_en <- select_best(wt_en_tuned, metric = "roc_auc")
+final_wt_en_model <- finalize_workflow(wt_en_wkflow, best_wt_en)
+
+#RF
+best_wt_rf <- select_best(wt_rf_tuned, metric = "roc_auc")
+final_wt_rf_model <- finalize_workflow(wt_rf_wkflow, best_wt_rf)
+
+#boosted tree
+best_wt_bt <- select_best(wt_bt_tuned, metric = "roc_auc")
+
+final_wt_bt_model <- finalize_workflow(wt_bt_wkflow, best_wt_bt)
+
+
+```
+
+## Fitting ALL the models together
+```{r}
+#fit models together
+
+#Log reg
+wt_log_fit <- fit(wt_log_wkflow, train_all)
+
+#knn
+wt_knn_fit <- fit(final_wt_knn_model, train_all)
+
+#lda
+wt_lda_fit <- fit(wt_lda_wkflow, train_all)
+
+#qda
+wt_qda_fit <- fit(wt_qda_wkflow, train_all)
+
+#en
+wt_en_fit <- fit(final_wt_en_model, train_all)
+
+#rf
+wt_rf_fit <- fit(final_wt_rf_model, train_all)
+
+#bt
+wt_bt_fit <- fit(final_wt_bt_model, train_all)
+```
+
+## ROC_AUC from train_all data
+
+```{r}
+
+#log regression
+wt_log_train_results_1 <- augment(wt_log_fit, new_data = train_all)
+predictions_log <- select(wt_log_train_results_1, .pred_1, Status)
+truth_log <- as.numeric(as.character(predictions_log$Status))
+
+wt_log_train_results <- auc(roc(truth_log, predictions_log$.pred_1))
+
+#knn
+wt_knn_train_results_1 <- augment(wt_knn_fit, new_data = train_all)
+predictions_knn <- select(wt_knn_train_results_1, .pred_1, Status)
+truth_knn <- as.numeric(as.character(predictions_knn$Status))
+
+wt_knn_train_results <- auc(roc(truth_knn, predictions_knn$.pred_1))
+
+#lda
+wt_lda_train_results_1 <- augment(wt_lda_fit, new_data = train_all)
+predictions_lda <- select(wt_lda_train_results_1, .pred_1, Status)
+truth_lda <- as.numeric(as.character(predictions_lda$Status))
+
+wt_lda_train_results <- auc(roc(truth_lda, predictions_lda$.pred_1))
+
+#qda
+wt_qda_train_results_1 <- augment(wt_qda_fit, new_data = train_all) 
+predictions_qda <- select(wt_qda_train_results_1, .pred_1, Status)
+truth_qda <- as.numeric(as.character(predictions_qda$Status))
+
+wt_qda_train_results <- auc(roc(truth_qda, predictions_qda$.pred_1))
+
+#en
+wt_en_train_results_1 <- augment(wt_en_fit, new_data = train_all)
+predictions_en <- select(wt_en_train_results_1, .pred_1, Status)
+truth_en <- as.numeric(as.character(predictions_en$Status))
+
+wt_en_train_results <- auc(roc(truth_en, predictions_en$.pred_1))
+
+#rf
+wt_rf_train_results1 <- augment(wt_rf_fit, new_data = train_all) 
+predictions_rf <- select(wt_rf_train_results1, .pred_1, Status)
+truth_rf <- as.numeric(as.character(predictions_rf$Status))
+
+wt_rf_train_results <- auc(roc(truth_rf, predictions_rf$.pred_1))
+
+#bt
+wt_bt_train1_results_1 <- augment(wt_bt_fit, new_data = train_all)
+predictions_bt <- select(wt_bt_train_results_1, .pred_1, Status)
+truth_bt <- as.numeric(as.character(predictions_bt$Status))
+
+wt_bt_train_results <- auc(roc(truth_bt, predictions_bt$.pred_1))
+
+```
+
+## AUC-ROC values for each model
+
+```{r}
+wt_models <- c("Logistic Regression", "K-Nearest Neighbor", "Linear Discrimination Analysis", "Quadratic Discriminant Analysis", "Elastic Net", "Random Forest", "Gradient-Boosted Trees")
+
+wt_models_roc_auc <- c(wt_log_train_results,
+                       wt_knn_train_results,
+                       wt_lda_train_results,
+                       wt_qda_train_results,
+                        wt_en_train_results,
+                        wt_rf_train_results,
+                        wt_bt_train_results
+                       )
+
+wt_training_results <- tibble(Model = wt_models, ROC_AUC = wt_models_roc_auc) %>% 
+  arrange(-wt_models_roc_auc) %>% 
+  gt() %>% 
+  tab_header(title = "Predicting Infection Status: AUC-ROC Values") %>% 
+  gt_theme_nytimes() %>% 
+  cols_label(ROC_AUC = "ROC-AUC")
+
+wt_training_results
+
+```
+
+#----------------------------------------------------------------------
+
+## Test Data
+
+```{r}
+
+#log regression
+wt_log_test_results_1 <- augment(wt_log_fit, new_data = test_all)
+predictions_test_log <- select(wt_log_test_results_1, .pred_1, Status)
+truth_test_log <- as.numeric(as.character(predictions_test_log$Status))
+
+wt_log_test_results <- auc(roc(truth_test_log, predictions_test_log$.pred_1))
+wt_log_accuracy <- augment(wt_log_fit, new_data = test_all) %>% 
+  accuracy(Status, estimate = .pred_class)
+
+
+#knn
+wt_knn_test_results_1 <- augment(wt_knn_fit, new_data = test_all)
+predictions_test_knn <- select(wt_knn_test_results_1, .pred_1, Status)
+truth_test_knn <- as.numeric(as.character(predictions_test_knn$Status))
+
+wt_knn_test_results <- auc(roc(truth_test_knn, predictions_test_knn$.pred_1))
+wt_knn_accuracy <- augment(wt_knn_fit, new_data = test_all) %>% 
+  accuracy(Status, estimate = .pred_class)
+
+#lda
+wt_lda_test_results_1 <- augment(wt_lda_fit, new_data = test_all)
+predictions_test_lda <- select(wt_lda_test_results_1, .pred_1, Status)
+truth_test_lda <- as.numeric(as.character(predictions_test_lda$Status))
+
+wt_lda_test_results <- auc(roc(truth_test_lda, predictions_test_lda$.pred_1))
+wt_lda_accuracy <- augment(wt_lda_fit, new_data = test_all) %>% 
+  accuracy(Status, estimate = .pred_class)
+
+#qda
+wt_qda_test_results_1 <- augment(wt_qda_fit, new_data = test_all)
+predictions_test_qda <- select(wt_qda_test_results_1, .pred_1, Status)
+truth_test_qda <- as.numeric(as.character(predictions_test_qda$Status))
+
+wt_qda_test_results <- auc(roc(truth_test_qda, predictions_test_qda$.pred_1))
+wt_qda_accuracy <- augment(wt_qda_fit, new_data = test_all) %>% 
+  accuracy(Status, estimate = .pred_class)
+
+#en
+wt_en_test_results_1 <- augment(wt_en_fit, new_data = test_all)
+predictions_test_en <- select(wt_en_test_results_1, .pred_1, Status)
+truth_test_en <- as.numeric(as.character(predictions_test_en$Status))
+
+wt_en_test_results <- auc(roc(truth_test_en, predictions_test_en$.pred_1))
+wt_en_accuracy <- augment(wt_en_fit, new_data = test_all) %>% 
+  accuracy(Status, estimate = .pred_class)
+
+#rf
+wt_rf_test_results_1 <- augment(wt_rf_fit, new_data = test_all)
+predictions_test_rf <- select(wt_rf_test_results_1, .pred_1, Status)
+truth_test_rf <- as.numeric(as.character(predictions_test_rf$Status))
+
+wt_rf_test_results <- auc(roc(truth_test_rf, predictions_test_rf$.pred_1))
+wt_rf_accuracy <- augment(wt_rf_fit, new_data = test_all) %>% 
+  accuracy(Status, estimate = .pred_class)
+
+#bt
+wt_bt_test1_results_1 <- augment(wt_bt_fit, new_data = test_all)
+predictions_test_bt <- select(wt_bt_test_results_1, .pred_1, Status)
+truth_test_bt <- as.numeric(as.character(predictions_test_bt$Status))
+
+wt_bt_test_results <- auc(roc(truth_test_bt, predictions_test_bt$.pred_1))
+wt_bt_accuracy <- augment(wt_bt_fit, new_data = test_all) %>% 
+  accuracy(Status, estimate = .pred_class)
+
+#-----------------
+
+wt_models_test <- c("Random Forest", "Gradient-Boosted Trees", "K-Nearest Neighbor", "Quadratic Discriminant Analysis", "Elastic Net", "Logistic Regression",  "Linear Discrimination Analysis")
+
+tibble(Model = wt_models_test, ROC_AUC = c(wt_rf_test_results,
+                                      wt_bt_test_results,
+                                      wt_knn_test_results,
+                                      wt_qda_test_results,
+                                      wt_en_test_results,
+                                      wt_log_test_results,
+                                      wt_lda_test_results
+                                     
+                                     
+                                     ), 
+       Accuracy = c(wt_rf_accuracy$.estimate,
+                    wt_bt_accuracy$.estimate,
+                    wt_knn_accuracy$.estimate,
+                    wt_qda_accuracy$.estimate,
+                    wt_en_accuracy$.estimate,
+                    wt_log_accuracy$.estimate,
+                    wt_lda_accuracy$.estimate
+                    
+                    
+                    )) %>% 
+  gt() %>% 
+  tab_header(title = "Performance Metrics of Tested Models") %>% 
+  gt_theme_nytimes()
+
+```
+
+Looking at a confusion matrix
+```{r}
+final_log_model_test <- augment(wt_log_fit, test_all)
+final_knn_model_test <- augment(wt_knn_fit, test_all)
+final_lda_model_test <- augment(wt_lda_fit, test_all)
+final_qda_model_test <- augment(wt_qda_fit, test_all)
+final_en_model_test <- augment(wt_en_fit, test_all)
+final_rf_model_test <- augment(wt_rf_fit, test_all)
+final_bt_model_test <- augment(wt_bt_fit, test_all)
+
+conf_mat(final_rf_model_test, truth = Status, .pred_class) %>% 
+  autoplot(type = "heatmap")
+
+```
+
+
+## All conf matrix in one facet
+
+```{r}
+# List of final model fit objects
+final_model_fits <- list(wt_log_fit, 
+                         wt_knn_fit, 
+                         wt_lda_fit, 
+                         wt_qda_fit, 
+                         wt_en_fit, 
+                         wt_rf_fit, 
+                         wt_bt_fit)
+
+# List of model names
+model_names <- c("LOG", 
+                 "KNN", 
+                 "LDA", 
+                 "QDA", 
+                 "EN", 
+                 "RF", 
+                 "BT")
+
+# Create confusion matrix plots for each model
+confusion_plots <- lapply(seq_along(final_model_fits), function(i) {
+  final_model_test <- augment(final_model_fits[[i]], new_data = test_all)
+  conf_mat(final_model_test, truth = Status, .pred_class) %>% 
+    autoplot(type = "heatmap") +
+    ggtitle(model_names[i]) +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"), # Larger and bold title
+      text = element_text(face = "bold", size = 6),                     # Bold and larger numbers
+      axis.text = element_text(size = 10),                              # Larger axis values (0 and 1)
+      axis.title = element_text(size = 12, face = "bold")               # Larger and bold axis titles
+    )
+})
+
+# Arrange the confusion matrix plots in a grid
+grid.arrange(grobs = confusion_plots, ncol = 4)
+
+```
+
+
+Plotting the ROC Curve
+
+```{r}
+# List of final models
+final_models <- list(wt_log_fit, 
+                     wt_knn_fit, 
+                     wt_lda_fit, 
+                     wt_qda_fit, 
+                     wt_en_fit, 
+                     wt_rf_fit, 
+                     wt_bt_fit)
+
+# List of titles corresponding to each model
+titles <- c("LOG", 
+            "KNN", 
+            "LDA", 
+            "QDA", 
+            "EN", 
+            "RF", 
+            "BT")
+
+
+# Create plots individually with centered titles and capitalized axis labels
+plots_list <- lapply(seq_along(final_models), function(i) {
+  p <- augment(final_models[[i]], new_data = test_all) %>% 
+    roc_curve(truth = Status, .pred_1) %>% 
+    autoplot() +
+    ggtitle(titles[i]) +
+    theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"), # Larger and bold title
+      text = element_text(face = "bold", size = 6),                     # Bold and larger numbers
+      axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 10),# Larger axis values (0 and 1)
+      axis.title = element_text(size = 10, face = "bold"))+
+    labs(x = "Specificity", y = "Sensitivity") # Set the axis titles
+  return(p)
+})
+
+# Arrange plots in a grid
+grid.arrange(grobs = plots_list, ncol = 4)
+
+
+```
+
+## Variable importance Plotting
+
+```{r}
+
+log_vip <- wt_log_fit %>% 
+  extract_fit_engine() %>% 
+  vip(aesthetics = list(fill = "maroon", color = "black")) +
+  ggtitle("Logistic Regression VIP")
+
+en_vip <- wt_en_fit %>% 
+  extract_fit_engine() %>% 
+  vip(aesthetics = list(fill = "maroon", color = "black")) +
+  ggtitle("Elastic Net VIP")
+
+rf_vip <- wt_rf_fit %>% 
+  extract_fit_engine() %>% 
+  vip(aesthetics = list(fill = "maroon", color = "black")) +
+  ggtitle("Random Forest VIP")
+
+bt_vip <- wt_bt_fit %>% 
+  extract_fit_engine() %>% 
+  vip(aesthetics = list(fill = "maroon", color = "black")) + 
+  ggtitle("Boosted Trees VIP")
+
+
+plot_grid(log_vip, en_vip, rf_vip, bt_vip, nrow = 2)
+```
